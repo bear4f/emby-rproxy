@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # emby-rproxy.sh
-# Menu-driven Nginx reverse proxy manager for Emby
+# Menu-driven Nginx reverse proxy manager for Emby (Debian-friendly, rollback-safe, self-healing)
 # Features: add/list/edit/delete, extra port entries, optional TLS, optional BasicAuth, optional subpath,
-# nginx -t/-T validate + automatic rollback, Debian-friendly.
+# nginx -t/-T validate + automatic rollback, self-heal QUIC/HTTP3 template residues, ensure sites-enabled include for certbot.
 set -euo pipefail
 
 # -------------------- config --------------------
@@ -28,6 +28,7 @@ prompt() {
   fi
   printf -v "$__var" "%s" "$input"
 }
+
 yesno() {
   local __var="$1" __msg="$2" __def="${3:-y}"
   local input=""
@@ -40,7 +41,6 @@ yesno() {
 sanitize_name() { echo "$1" | tr -cd '[:alnum:]._-' | sed 's/^\.*//;s/\.*$//'; }
 
 strip_scheme() {
-  # strip http:// or https:// from a value
   local s="$1"
   s="${s#http://}"
   s="${s#https://}"
@@ -55,8 +55,6 @@ is_port() {
 }
 
 normalize_ports_csv() {
-  # input: " 18443,  28096 ,"
-  # output: "18443,28096" (dedup not guaranteed but trimmed)
   local csv="$1"
   csv="$(echo "$csv" | tr -d ' ')"
   csv="${csv#,}"
@@ -109,11 +107,9 @@ restore_nginx() {
 }
 
 validate_nginx() {
-  # nginx -t + nginx -T (full dump)
-  # NOTE: capture stderr to dumpfile too, so errors are visible.
   local dumpfile="$1"
   nginx -t >/dev/null
-  nginx -T >"$dumpfile" 2>&1
+  nginx -T >"$dumpfile" 2>/dev/null
 }
 
 reload_nginx() {
@@ -137,18 +133,6 @@ open_fw_ports_ufw() {
   done
 }
 
-# ---------------- Cloudflare port hint (section 3) ----------------
-cf_supported_port_warn() {
-  local p="$1"
-  # Common Cloudflare proxied ports (non-exhaustive, but covers usual choices)
-  local ok="80 443 2052 2053 2082 2083 2086 2087 2095 2096 8080 8443 8880"
-  if echo " $ok " | grep -q " $p "; then
-    return 0
-  fi
-  echo "⚠️ 提示：端口 $p 可能不被 Cloudflare 小黄云代理支持。若开启橙云后无法访问，建议改用 443/8443/2053/2083/2087/2096/8080/8880 等。"
-}
-# -----------------------------------------------------------------
-
 conf_path_for_domain() {
   local domain="$1"
   local safe; safe="$(sanitize_name "$domain")"
@@ -160,6 +144,127 @@ enabled_path_for_domain() {
   local safe; safe="$(sanitize_name "$domain")"
   echo "${SITES_ENAB}/${CONF_PREFIX}${safe}.conf"
 }
+
+# -------------------- Self-heal / Compat --------------------
+
+# Ensure Debian-style include exists so certbot-nginx can find server blocks in sites-enabled.
+ensure_sites_enabled_include() {
+  local main="/etc/nginx/nginx.conf"
+  [[ -f "$main" ]] || return 0
+
+  if grep -qE 'include\s+/etc/nginx/sites-enabled/\*;' "$main"; then
+    return 0
+  fi
+
+  cp -a "$main" "${main}.bak.$(date +%F_%H%M%S)"
+
+  # Prefer inserting after conf.d include if present; otherwise after "http {"
+  if grep -qE 'include\s+/etc/nginx/conf\.d/\*\.conf;' "$main"; then
+    sed -i '/include\s\+\/etc\/nginx\/conf\.d\/\*\.conf;/a\    include /etc/nginx/sites-enabled/*;' "$main"
+  else
+    sed -i '/http\s*{/a\    include /etc/nginx/sites-enabled/*;' "$main"
+  fi
+}
+
+# Remove or neutralize common QUIC/HTTP3 template residues that break Debian nginx (1.18).
+# - Remove nginx.conf default 443 ssl server without certificate
+# - Comment nginx.conf QUIC/HTTP3 directives
+# - Comment any lines referencing $http3 under /etc/nginx
+nginx_self_heal_compat() {
+  local ts; ts="$(date +%F_%H%M%S)"
+  local main="/etc/nginx/nginx.conf"
+  local changed="n"
+
+  [[ -f "$main" ]] || return 0
+
+  # (1) Comment lines containing $http3 anywhere under /etc/nginx (unknown "http3" variable)
+  local http3_files
+  http3_files="$(grep -RIl '\$http3\b' /etc/nginx 2>/dev/null || true)"
+  if [[ -n "$http3_files" ]]; then
+    while read -r f; do
+      [[ -z "$f" ]] && continue
+      cp -a "$f" "${f}.bak.${ts}"
+      sed -i '/\$http3\b/s/^/# /' "$f"
+    done <<< "$http3_files"
+    changed="y"
+  fi
+
+  # (2) Comment problematic directives in nginx.conf (quic/http3/ssl_reject_handshake)
+  if grep -qiE '\b(quic_bpf|http3|ssl_reject_handshake)\b' "$main"; then
+    cp -a "$main" "${main}.bak.${ts}"
+    sed -i -E '
+      s/^\s*quic_bpf\b/# quic_bpf/;
+      s/^\s*http3\b/# http3/;
+      s/^\s*ssl_reject_handshake\b/# ssl_reject_handshake/;
+      s/^\s*(listen .*quic.*;)\s*$/# \1  # disabled by emby-rproxy/;
+    ' "$main"
+    changed="y"
+  fi
+
+  # (3) Remove a broken default 443 ssl server block in nginx.conf that lacks ssl_certificate
+  #     Typical pattern:
+  #       server { listen 443 ssl default_server ...; ... (no ssl_certificate) ... }
+  if grep -qE 'listen\s+443\s+ssl\s+default_server' "$main"; then
+    # detect if there exists a server{} containing listen 443 ssl default_server but no ssl_certificate
+    if ! awk '
+      BEGIN{in=0;has_listen=0;has_cert=0;}
+      /server[[:space:]]*\{/ {in=1;has_listen=0;has_cert=0;}
+      in && /listen[[:space:]]+443[[:space:]]+ssl[[:space:]]+default_server/ {has_listen=1;}
+      in && /ssl_certificate[[:space:]]+/ {has_cert=1;}
+      in && /\}/ {
+        if (has_listen && !has_cert) exit 10;
+        in=0;
+      }
+      END{exit 0;}
+    ' "$main"; then
+      cp -a "$main" "${main}.bak.${ts}"
+      # remove the first matching broken server{} block (best-effort)
+      awk '
+        BEGIN{state=0;lvl=0;match=0;}
+        # state 0: normal
+        # state 2: buffering first server block candidate
+        # state 1: dropping matched broken server block
+        {
+          if (state==0 && $0 ~ /server[[:space:]]*\{/){
+            buf[0]=$0; n=1; state=2; lvl=1; match=0; next
+          }
+          if (state==2){
+            buf[n++]=$0
+            if ($0 ~ /listen[[:space:]]+443[[:space:]]+ssl[[:space:]]+default_server/) match=1
+            if ($0 ~ /\{/) lvl++
+            if ($0 ~ /\}/){lvl--; if (lvl==0){
+              if (match==1){
+                # decide if cert exists inside buffered block
+                has_cert=0
+                for(i=0;i<n;i++){ if (buf[i] ~ /ssl_certificate[[:space:]]+/) has_cert=1 }
+                if (has_cert==0){
+                  # drop this block
+                  state=0; next
+                }
+              }
+              # not dropped: print buffered
+              for(i=0;i<n;i++) print buf[i]
+              state=0; next
+            }}
+            next
+          }
+          if (state==0){ print }
+        }
+      ' "$main" > /tmp/nginx.conf.healed && mv /tmp/nginx.conf.healed "$main"
+      changed="y"
+    fi
+  fi
+
+  # (4) Ensure sites-enabled include for certbot
+  ensure_sites_enabled_include && changed="y" || true
+
+  # (5) If changed, try reload (do not hard-fail)
+  if [[ "$changed" == "y" ]]; then
+    nginx -t >/dev/null 2>&1 && (systemctl restart nginx >/dev/null 2>&1 || true)
+  fi
+}
+
+# -------------------- Nginx site writer --------------------
 
 write_site_conf() {
   # Write or overwrite a site conf. Does NOT run certbot.
@@ -180,7 +285,6 @@ write_site_conf() {
   local origin="${origin_host}:${origin_port}"
   local safe_ports; safe_ports="$(normalize_ports_csv "$extra_ports_csv")"
 
-  # BasicAuth snippet
   local auth_snip=""
   if [[ "$enable_basicauth" == "y" ]]; then
     ensure_htpasswd
@@ -199,6 +303,7 @@ write_site_conf() {
 
         proxy_http_version 1.1;
 
+        # 421/Host-dependent origin safe default:
         proxy_set_header Host \$proxy_host;
         proxy_set_header X-Forwarded-Host \$host;
 
@@ -216,7 +321,7 @@ write_site_conf() {
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
 
-        client_max_body_size 50m;
+        client_max_body_size 500m;
 
         rewrite ^$subpath/(.*)\$ /\$1 break;
         proxy_redirect ~^(/.*)\$ $subpath\$1;
@@ -228,38 +333,33 @@ EOL
     fi
     location_block+=$'    }\n'
   else
-    # NOTE: section 1 - permanently fix Host header to avoid 421 behind Cloudflare/WAF
-    location_block=$(cat <<'EOL'
+    location_block=$(cat <<EOL
     location / {
-        ${auth_snip}proxy_pass ${origin_scheme}://${origin};
+        ${auth_snip}proxy_pass $origin_scheme://$origin;
 
         proxy_http_version 1.1;
 
-        proxy_set_header Host $proxy_host;
-        proxy_set_header X-Forwarded-Host $host;
+        # 421/Host-dependent origin safe default:
+        proxy_set_header Host \$proxy_host;
+        proxy_set_header X-Forwarded-Host \$host;
 
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
 
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
 
-        proxy_set_header Range $http_range;
-        proxy_set_header If-Range $http_if_range;
+        proxy_set_header Range \$http_range;
+        proxy_set_header If-Range \$http_if_range;
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
 
-        client_max_body_size 50m;
+        client_max_body_size 500m;
 EOL
 )
-    # The above heredoc used single quotes to preserve $variables, now we substitute bash vars manually.
-    location_block="${location_block//'${auth_snip}'/$auth_snip}"
-    location_block="${location_block//'${origin_scheme}'/$origin_scheme}"
-    location_block="${location_block//'${origin}'/$origin}"
-
     if [[ "$origin_scheme" == "https" ]]; then
       [[ "$upstream_insecure" == "y" ]] && location_block+=$'\n        proxy_ssl_verify off;\n'
       location_block+=$'        proxy_ssl_server_name on;\n'
@@ -267,7 +367,6 @@ EOL
     location_block+=$'    }\n'
   fi
 
-  # META line: parse-friendly
   cat > "$conf" <<EOL
 # ${TOOL_NAME}: Emby Reverse Proxy for ${domain}
 # Managed by ${TOOL_NAME}
@@ -342,7 +441,10 @@ certbot_enable_tls() {
   local email="$2"
 
   ensure_certbot
-  # certbot modifies existing conf (adds 443 server + redirects 80 -> 443)
+  # Make sure certbot can see the server block (sites-enabled include)
+  ensure_sites_enabled_include
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+
   certbot --nginx -d "$domain" --agree-tos -m "$email" --non-interactive --redirect
 }
 
@@ -382,8 +484,29 @@ print_usage_hint() {
   echo "注意："
   echo "  1) 用 IP + HTTPS 访问会证书不匹配（正常现象），推荐用域名走 HTTPS。"
   echo "  2) 额外端口是 HTTP（明文），如需端口也走 HTTPS 可后续扩展（但 IP 访问仍会证书不匹配）。"
+  echo "  3) 若回源本身有 Cloudflare/WAF，VPS 回源可能被 403/1020/拦截，这不是 Nginx 问题。"
   echo "============================================================="
   echo
+}
+
+# -------------------- Actions --------------------
+
+warn_cf_ports() {
+  local ports_csv="$1"
+  ports_csv="$(normalize_ports_csv "$ports_csv")"
+  [[ -z "$ports_csv" ]] && return 0
+  # Cloudflare proxied ports allowlist for HTTP: 80,8080,8880,2052,2082,2086,2095
+  # and for HTTPS: 443,2053,2083,2087,2096,8443
+  # Our extra ports are HTTP only. If user uses orange cloud, non-allowlist ports won't work through CF.
+  local ok_http_ports="80 8080 8880 2052 2082 2086 2095"
+  IFS=',' read -r -a arr <<<"$ports_csv"
+  for p in "${arr[@]}"; do
+    [[ -z "$p" ]] && continue
+    for ok in $ok_http_ports; do
+      [[ "$p" == "$ok" ]] && continue 2
+    done
+    echo "⚠️ 提示：端口 ${p} 可能不被 Cloudflare 小黄云代理支持。若开启橙云后无法访问，建议改用 8080/8880/2052/2082/2086/2095 等（或将该记录灰云直连）。"
+  done
 }
 
 action_add_or_edit() {
@@ -441,13 +564,9 @@ action_add_or_edit() {
       is_port "$p" || { echo "额外端口不合法：$p"; return 1; }
       [[ "$p" == "80" || "$p" == "443" ]] && { echo "额外端口不能用 80/443：$p"; return 1; }
     done
-
-    # Cloudflare port hint
-    for p in "${arr[@]}"; do
-      [[ -z "$p" ]] && continue
-      cf_supported_port_warn "$p"
-    done
   fi
+
+  warn_cf_ports "$EXTRA_PORTS"
 
   echo
   echo "---- 配置确认 ----"
@@ -462,13 +581,14 @@ action_add_or_edit() {
   echo
 
   ensure_deps
+  ensure_sites_enabled_include
+  nginx_self_heal_compat
 
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
   trap 'rm -f "$dump"' RETURN
 
-  # 1) Write config
   set +e
   write_site_conf "$DOMAIN" "$ORIGIN_HOST" "$ORIGIN_PORT" "$ORIGIN_SCHEME" \
                   "$ENABLE_BASICAUTH" "$BASIC_USER" "$BASIC_PASS" \
@@ -483,15 +603,12 @@ action_add_or_edit() {
     return 1
   fi
 
-  # 2) Validate + reload (rollback on fail)
   apply_with_rollback "$backup" "$dump" || return 1
 
-  # 3) UFW open ports (optional)
   if [[ "$ENABLE_UFW" == "y" ]]; then
     open_fw_ports_ufw "$EXTRA_PORTS"
   fi
 
-  # 4) TLS (optional) then validate again
   if [[ "$ENABLE_SSL" == "y" ]]; then
     set +e
     certbot_enable_tls "$DOMAIN" "$EMAIL"
@@ -503,7 +620,6 @@ action_add_or_edit() {
       reload_nginx
       return 1
     fi
-
     apply_with_rollback "$backup" "$dump" || return 1
   fi
 
@@ -552,7 +668,7 @@ action_list() {
 }
 
 action_delete() {
-  local DOMAIN
+  local DOMAIN DEL_CERT
   prompt DOMAIN "要删除的访问域名（server_name）"
   DOMAIN="$(strip_scheme "$DOMAIN")"
 
@@ -568,6 +684,9 @@ action_delete() {
   yesno DEL_CERT "是否同时删除证书（需要你手动执行 certbot delete）" "n"
 
   ensure_deps
+  ensure_sites_enabled_include
+  nginx_self_heal_compat
+
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
@@ -575,7 +694,6 @@ action_delete() {
 
   rm -f "$enabled" "$conf"
 
-  # Validate + reload with rollback
   if ! apply_with_rollback "$backup" "$dump"; then
     return 1
   fi
@@ -601,9 +719,13 @@ action_uninstall() {
   echo "  - 不会自动删除证书（如需可手动 certbot delete）"
   echo
 
+  local REMOVE_SITES
   yesno REMOVE_SITES "是否删除所有 ${CONF_PREFIX}*.conf 站点配置" "n"
   if [[ "$REMOVE_SITES" == "y" ]]; then
     ensure_deps
+    ensure_sites_enabled_include
+    nginx_self_heal_compat
+
     local backup dump
     backup="$(backup_nginx)"
     dump="$(mktemp)"
